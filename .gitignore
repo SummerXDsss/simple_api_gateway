@@ -11,3 +11,6 @@ venv/
 
 # Local temp artifacts
 .tmp/
+
+# Sensitive config (contains API keys)
+data/config.json
