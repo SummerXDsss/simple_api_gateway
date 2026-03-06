@@ -10,8 +10,13 @@ from fastapi.staticfiles import StaticFiles
 
 from .config_store import ConfigStore
 from .relay import (
+    anthropic_message_response_to_legacy_complete,
     assert_key_can_use_model,
+    legacy_anthropic_complete_to_messages_request,
     list_all_model_aliases,
+    normalize_openai_chat_payload,
+    openai_chat_response_to_completions,
+    openai_chat_response_to_responses_api,
     relay_chat_completion,
     relay_messages,
     resolve_provider_and_model,
@@ -28,7 +33,7 @@ from .security import generate_local_api_key, verify_local_api_key
 
 STORE = ConfigStore(Path("data/config.json"))
 
-app = FastAPI(title="Local AI API Aggregator", version="0.1.0")
+app = FastAPI(title="Local AI API Aggregator", version="0.2.0")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -73,6 +78,42 @@ def _authenticate_local_key(request: Request, config: AppConfig) -> LocalKeyReco
     if not record:
         raise HTTPException(status_code=401, detail="Invalid or disabled local API key.")
     return record
+
+
+async def _relay_openai_compatible(
+    payload: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    config = STORE.load()
+    local_key = _authenticate_local_key(request, config)
+
+    normalized_payload = normalize_openai_chat_payload(payload)
+    model_alias = normalized_payload["model"]
+
+    provider, provider_model = resolve_provider_and_model(config, model_alias)
+    assert_key_can_use_model(local_key, model_alias)
+
+    return await relay_chat_completion(
+        normalized_payload,
+        provider,
+        provider_model,
+        model_alias,
+    )
+
+
+async def _relay_anthropic_messages_compatible(
+    payload: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    config = STORE.load()
+    local_key = _authenticate_local_key(request, config)
+
+    model_alias = payload.get("model")
+    if not isinstance(model_alias, str) or not model_alias:
+        raise HTTPException(status_code=400, detail="Request body requires model.")
+
+    provider, provider_model = resolve_provider_and_model(config, model_alias)
+    assert_key_can_use_model(local_key, model_alias)
+
+    return await relay_messages(payload, provider, provider_model, model_alias)
 
 
 @app.on_event("startup")
@@ -202,33 +243,36 @@ def delete_local_key(key_id: str) -> dict[str, bool]:
 
 @app.post("/v1/chat/completions")
 async def openai_chat_proxy(payload: dict[str, Any], request: Request) -> JSONResponse:
-    config = STORE.load()
-    local_key = _authenticate_local_key(request, config)
-
-    model_alias = payload.get("model")
-    if not isinstance(model_alias, str) or not model_alias:
-        raise HTTPException(status_code=400, detail="Request body requires model.")
-
-    provider, provider_model = resolve_provider_and_model(config, model_alias)
-    assert_key_can_use_model(local_key, model_alias)
-
-    result = await relay_chat_completion(payload, provider, provider_model, model_alias)
+    result = await _relay_openai_compatible(payload, request)
     return JSONResponse(content=result)
+
+
+@app.post("/v1/responses")
+async def openai_responses_proxy(payload: dict[str, Any], request: Request) -> JSONResponse:
+    result = await _relay_openai_compatible(payload, request)
+    return JSONResponse(content=openai_chat_response_to_responses_api(result))
+
+
+@app.post("/v1/completions")
+async def openai_legacy_completions_proxy(
+    payload: dict[str, Any], request: Request
+) -> JSONResponse:
+    result = await _relay_openai_compatible(payload, request)
+    return JSONResponse(content=openai_chat_response_to_completions(result))
 
 
 @app.post("/v1/messages")
 async def anthropic_messages_proxy(
     payload: dict[str, Any], request: Request
 ) -> JSONResponse:
-    config = STORE.load()
-    local_key = _authenticate_local_key(request, config)
-
-    model_alias = payload.get("model")
-    if not isinstance(model_alias, str) or not model_alias:
-        raise HTTPException(status_code=400, detail="Request body requires model.")
-
-    provider, provider_model = resolve_provider_and_model(config, model_alias)
-    assert_key_can_use_model(local_key, model_alias)
-
-    result = await relay_messages(payload, provider, provider_model, model_alias)
+    result = await _relay_anthropic_messages_compatible(payload, request)
     return JSONResponse(content=result)
+
+
+@app.post("/v1/complete")
+async def anthropic_legacy_complete_proxy(
+    payload: dict[str, Any], request: Request
+) -> JSONResponse:
+    converted = legacy_anthropic_complete_to_messages_request(payload)
+    result = await _relay_anthropic_messages_compatible(converted, request)
+    return JSONResponse(content=anthropic_message_response_to_legacy_complete(result))

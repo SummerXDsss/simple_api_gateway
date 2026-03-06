@@ -60,20 +60,19 @@ body {
   flex-wrap: wrap;
 }
 
+h2,
+h3,
+h4 {
+  margin: 0;
+}
+
 h2 {
-  margin: 0 0 12px;
+  margin-bottom: 10px;
 }
 
 .hint {
   color: var(--muted);
   font-size: 13px;
-}
-
-.editor {
-  height: 440px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  overflow: hidden;
 }
 
 .actions {
@@ -112,12 +111,70 @@ button.danger {
   color: var(--danger);
 }
 
-input[type="text"] {
+input[type="text"],
+select {
   width: 100%;
-  max-width: 260px;
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 8px 10px;
+  background: #fff;
+}
+
+label {
+  display: block;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.provider-list {
+  display: grid;
+  gap: 12px;
+}
+
+.provider-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+  background: #fbfdff;
+}
+
+.provider-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.provider-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.models-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.model-edit-table,
+.key-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.model-edit-table th,
+.model-edit-table td,
+.key-table th,
+.key-table td {
+  border-bottom: 1px solid var(--line);
+  padding: 8px;
+  text-align: left;
+  vertical-align: top;
+  font-size: 14px;
 }
 
 .new-key-grid {
@@ -147,6 +204,7 @@ input[type="text"] {
   border: 1px solid var(--line);
   border-radius: 999px;
   font-size: 13px;
+  background: #fff;
 }
 
 .result-box {
@@ -156,27 +214,8 @@ input[type="text"] {
   border-radius: 8px;
 }
 
-.key-table {
-  width: 100%;
-  border-collapse: collapse;
-  min-width: 980px;
-}
-
-.key-table th,
-.key-table td {
-  border-bottom: 1px solid var(--line);
-  padding: 10px;
-  text-align: left;
-  vertical-align: top;
-  font-size: 14px;
-}
-
-.key-table tbody tr:hover {
-  background: #f9fbff;
-}
-
 .key-models {
-  min-width: 240px;
+  min-width: 260px;
 }
 
 .status {
@@ -205,28 +244,17 @@ input[type="text"] {
   background: #f1fff7;
 }
 
-.model-table {
-  width: 100%;
-  border-collapse: collapse;
-}
-
-.model-table th,
-.model-table td {
-  border-bottom: 1px solid var(--line);
-  padding: 8px;
-  font-size: 14px;
-}
-
 @media (max-width: 960px) {
   .page {
     padding: 12px;
   }
 
-  .editor {
-    height: 360px;
+  .key-table {
+    display: block;
+    overflow-x: auto;
   }
 
-  .key-table {
+  .model-edit-table {
     display: block;
     overflow-x: auto;
   }

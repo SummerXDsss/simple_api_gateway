@@ -67,7 +67,9 @@ def _openai_content_to_text(content: Any) -> str:
                 continue
             if isinstance(block, dict):
                 block_type = block.get("type")
-                if block_type == "text" and isinstance(block.get("text"), str):
+                if block_type in ("text", "input_text", "output_text") and isinstance(
+                    block.get("text"), str
+                ):
                     chunks.append(block["text"])
                 elif isinstance(block.get("content"), str):
                     chunks.append(block["content"])
@@ -91,6 +93,207 @@ def _anthropic_content_to_text(content: Any) -> str:
         if isinstance(maybe_text, str):
             return maybe_text
     return ""
+
+
+def _normalize_role(value: str | None) -> str:
+    if value in ("assistant", "system", "user"):
+        return value
+    return "user"
+
+
+def _responses_input_to_messages(input_value: Any) -> list[dict[str, str]]:
+    if isinstance(input_value, str):
+        return [{"role": "user", "content": input_value}]
+
+    if not isinstance(input_value, list):
+        raise HTTPException(status_code=400, detail="input must be a string or list.")
+
+    messages: list[dict[str, str]] = []
+    for item in input_value:
+        if isinstance(item, str):
+            messages.append({"role": "user", "content": item})
+            continue
+
+        if not isinstance(item, dict):
+            continue
+
+        role = _normalize_role(item.get("role"))
+
+        if "content" in item:
+            content_text = _openai_content_to_text(item.get("content"))
+            messages.append({"role": role, "content": content_text})
+            continue
+
+        if item.get("type") in ("input_text", "output_text") and isinstance(
+            item.get("text"), str
+        ):
+            messages.append({"role": role, "content": item["text"]})
+
+    if not messages:
+        raise HTTPException(status_code=400, detail="No usable messages in input.")
+
+    return messages
+
+
+def normalize_openai_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    model = payload.get("model")
+    if not isinstance(model, str) or not model:
+        raise HTTPException(status_code=400, detail="Request body requires model.")
+
+    messages: Any = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        if "input" in payload:
+            messages = _responses_input_to_messages(payload.get("input"))
+        elif "prompt" in payload:
+            prompt = payload.get("prompt")
+            if isinstance(prompt, str) and prompt:
+                messages = [{"role": "user", "content": prompt}]
+            else:
+                raise HTTPException(status_code=400, detail="prompt must be a string.")
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Request requires messages, input, or prompt.",
+            )
+
+    normalized: dict[str, Any] = {"model": model, "messages": messages}
+
+    max_tokens = (
+        payload.get("max_tokens")
+        or payload.get("max_completion_tokens")
+        or payload.get("max_output_tokens")
+    )
+    if max_tokens is not None:
+        normalized["max_tokens"] = max_tokens
+
+    for field in (
+        "temperature",
+        "top_p",
+        "stop",
+        "stream",
+        "presence_penalty",
+        "frequency_penalty",
+        "seed",
+        "n",
+        "user",
+    ):
+        if field in payload:
+            normalized[field] = payload[field]
+
+    return normalized
+
+
+def openai_chat_response_to_responses_api(response: dict[str, Any]) -> dict[str, Any]:
+    choices = response.get("choices")
+    first = choices[0] if isinstance(choices, list) and choices else {}
+    message = first.get("message") if isinstance(first, dict) else {}
+    if not isinstance(message, dict):
+        message = {}
+
+    output_text = _openai_content_to_text(message.get("content", ""))
+
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+
+    return {
+        "id": response.get("id", "resp-local"),
+        "object": "response",
+        "created_at": response.get("created", int(time.time())),
+        "status": "completed",
+        "model": response.get("model", ""),
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": output_text,
+                        "annotations": [],
+                    }
+                ],
+            }
+        ],
+        "output_text": output_text,
+        "usage": {
+            "input_tokens": int(usage.get("prompt_tokens") or 0),
+            "output_tokens": int(usage.get("completion_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0),
+        },
+    }
+
+
+def openai_chat_response_to_completions(response: dict[str, Any]) -> dict[str, Any]:
+    choices = response.get("choices")
+    first = choices[0] if isinstance(choices, list) and choices else {}
+    message = first.get("message") if isinstance(first, dict) else {}
+    if not isinstance(message, dict):
+        message = {}
+
+    completion_text = _openai_content_to_text(message.get("content", ""))
+
+    return {
+        "id": response.get("id", "cmpl-local"),
+        "object": "text_completion",
+        "created": response.get("created", int(time.time())),
+        "model": response.get("model", ""),
+        "choices": [
+            {
+                "text": completion_text,
+                "index": 0,
+                "logprobs": None,
+                "finish_reason": first.get("finish_reason") if isinstance(first, dict) else "stop",
+            }
+        ],
+        "usage": response.get("usage", {}),
+    }
+
+
+def legacy_anthropic_complete_to_messages_request(
+    payload: dict[str, Any]
+) -> dict[str, Any]:
+    model = payload.get("model")
+    if not isinstance(model, str) or not model:
+        raise HTTPException(status_code=400, detail="Request body requires model.")
+
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise HTTPException(status_code=400, detail="prompt must be a non-empty string.")
+
+    normalized_prompt = prompt.replace("\r\n", "\n")
+    normalized_prompt = normalized_prompt.replace("\n\nHuman:", "")
+    normalized_prompt = normalized_prompt.replace("\n\nAssistant:", "")
+    normalized_prompt = normalized_prompt.strip()
+
+    converted: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": normalized_prompt}],
+        "max_tokens": payload.get("max_tokens_to_sample") or 1024,
+    }
+
+    for source, target in (
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("stop_sequences", "stop_sequences"),
+    ):
+        if source in payload:
+            converted[target] = payload[source]
+
+    return converted
+
+
+def anthropic_message_response_to_legacy_complete(
+    response: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "id": response.get("id", "compl-local"),
+        "type": "completion",
+        "model": response.get("model", ""),
+        "completion": _anthropic_content_to_text(response.get("content", [])),
+        "stop_reason": response.get("stop_reason"),
+    }
 
 
 def _map_anthropic_stop_reason(value: str | None) -> str:
@@ -117,7 +320,7 @@ def openai_chat_request_to_anthropic(
     if payload.get("stream"):
         raise HTTPException(
             status_code=400,
-            detail="stream=true is not supported in this MVP.",
+            detail="stream=true is not supported in this version.",
         )
 
     messages = payload.get("messages")
@@ -172,7 +375,7 @@ def anthropic_messages_request_to_openai_chat(
     if payload.get("stream"):
         raise HTTPException(
             status_code=400,
-            detail="stream=true is not supported in this MVP.",
+            detail="stream=true is not supported in this version.",
         )
 
     messages = payload.get("messages")

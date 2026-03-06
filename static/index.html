@@ -1,82 +1,67 @@
 ﻿<!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Local AI API Aggregator</title>
-    <link
-      rel="stylesheet"
-      href="https://cdn.jsdelivr.net/npm/jsoneditor@9.10.5/dist/jsoneditor.min.css"
-    />
+    <title>Local AI API Gateway</title>
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
     <main class="page">
       <header class="hero">
-        <h1>Local AI API Aggregator</h1>
-        <p>
-          Configure upstream providers, manage local API keys, and control
-          model access.
-        </p>
+        <h1>Local AI API Gateway</h1>
+        <p>直接管理供应商、模型、协议和本地中转 Key。</p>
       </header>
 
       <section class="card">
         <div class="card-title-row">
-          <h2>Provider Config (JSON)</h2>
+          <h2>供应商配置</h2>
           <div class="actions">
-            <button id="btn-load" type="button">Reload</button>
-            <button id="btn-save" type="button" class="primary">Save</button>
+            <button id="btn-reload" type="button">重新加载</button>
+            <button id="btn-add-provider" type="button">新增供应商</button>
+            <button id="btn-save-config" type="button" class="primary">保存配置</button>
           </div>
         </div>
         <p class="hint">
-          Edit providers: <code>base_url</code>, <code>protocol</code>
-          (<code>openai</code>/<code>anthropic</code>),
-          <code>api_key</code>, and per-model enable flags.
+          每个供应商可配置：`base_url`、协议（OpenAI/Anthropic）、`api_key`、可用模型列表。
         </p>
-        <div id="editor" class="editor"></div>
+        <div id="provider-list" class="provider-list"></div>
       </section>
 
       <section class="card">
-        <h2>Model Overview</h2>
-        <div id="model-overview"></div>
-      </section>
-
-      <section class="card">
-        <h2>Create Local API Key</h2>
+        <h2>创建本地 API Key</h2>
         <div class="new-key-grid">
           <label>
-            Key name
+            Key 名称
             <input id="new-key-name" type="text" value="default-key" />
           </label>
           <div>
-            <div class="label">Allowed models</div>
+            <div class="label">允许的模型</div>
             <div id="new-key-models" class="model-pills"></div>
-            <p class="hint">No selection means this key can use all enabled models.</p>
+            <p class="hint">不勾选任何模型 = 可访问所有已启用模型。</p>
           </div>
         </div>
         <div class="actions">
-          <button id="btn-generate-key" type="button" class="primary">
-            Generate Local Key
-          </button>
+          <button id="btn-generate-key" type="button" class="primary">生成本地 Key</button>
         </div>
         <div class="result-box">
-          <div class="label">Generated key (shown once):</div>
-          <code id="generated-key">(not generated yet)</code>
+          <div class="label">新 Key（只显示一次）</div>
+          <code id="generated-key">(尚未生成)</code>
         </div>
       </section>
 
       <section class="card">
-        <h2>Local API Keys</h2>
+        <h2>本地 API Keys</h2>
         <table class="key-table">
           <thead>
             <tr>
               <th>ID</th>
-              <th>Name</th>
-              <th>Prefix</th>
-              <th>Enabled</th>
-              <th>Allowed Models</th>
-              <th>Created At</th>
-              <th>Actions</th>
+              <th>名称</th>
+              <th>前缀</th>
+              <th>启用</th>
+              <th>允许模型</th>
+              <th>创建时间</th>
+              <th>操作</th>
             </tr>
           </thead>
           <tbody id="key-table-body"></tbody>
@@ -84,21 +69,23 @@
       </section>
 
       <section class="card">
-        <h2>How to Call</h2>
-        <pre><code>POST /v1/chat/completions
-Authorization: Bearer &lt;local_api_key&gt;
-Content-Type: application/json
+        <h2>兼容接口</h2>
+        <pre><code>OpenAI:
+POST /v1/chat/completions
+POST /v1/responses
+POST /v1/completions
 
-{
-  "model": "gpt-4.1-mini",
-  "messages": [{"role": "user", "content": "hello"}]
-}</code></pre>
+Anthropic:
+POST /v1/messages
+POST /v1/complete
+
+Header:
+Authorization: Bearer &lt;local_api_key&gt;</code></pre>
       </section>
 
       <div id="status" class="status"></div>
     </main>
 
-    <script src="https://cdn.jsdelivr.net/npm/jsoneditor@9.10.5/dist/jsoneditor.min.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>

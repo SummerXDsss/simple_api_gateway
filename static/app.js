@@ -1,4 +1,4 @@
-﻿let editor = null;
+﻿let stateConfig = { providers: [], local_keys: [] };
 let cachedModels = [];
 
 function escapeHtml(value) {
@@ -29,30 +29,39 @@ async function apiFetch(url, options = {}) {
   };
 
   const response = await fetch(url, merged);
-  if (!response.ok) {
-    let detail = "request failed";
+  const raw = await response.text();
+  let parsed = null;
+
+  if (raw) {
     try {
-      const body = await response.json();
-      detail = body.detail ? JSON.stringify(body.detail) : JSON.stringify(body);
+      parsed = JSON.parse(raw);
     } catch (_err) {
-      detail = await response.text();
+      parsed = null;
     }
-    throw new Error(`${response.status} ${detail}`);
   }
 
-  if (response.status === 204) {
+  if (!response.ok) {
+    const detail = parsed?.detail ?? raw ?? "request failed";
+    throw new Error(`${response.status} ${typeof detail === "string" ? detail : JSON.stringify(detail)}`);
+  }
+
+  if (!raw) {
     return null;
   }
 
-  return response.json();
+  return parsed ?? raw;
 }
 
-function collectModelAliases(config) {
+function ensureConfigShape(config) {
+  return {
+    providers: Array.isArray(config?.providers) ? config.providers : [],
+    local_keys: Array.isArray(config?.local_keys) ? config.local_keys : [],
+  };
+}
+
+function collectModelAliases() {
   const unique = new Set();
-  if (!config || !Array.isArray(config.providers)) {
-    return [];
-  }
-  config.providers.forEach((provider) => {
+  stateConfig.providers.forEach((provider) => {
     if (!Array.isArray(provider.models)) {
       return;
     }
@@ -62,14 +71,40 @@ function collectModelAliases(config) {
       }
     });
   });
-  return Array.from(unique).sort();
+  cachedModels = Array.from(unique).sort();
+}
+
+function makeDefaultProvider() {
+  const idx = stateConfig.providers.length + 1;
+  return {
+    id: `provider-${idx}`,
+    name: `Provider ${idx}`,
+    base_url: "https://api.openai.com",
+    protocol: "openai",
+    api_key: "",
+    models: [
+      {
+        alias: `model-${idx}-1`,
+        upstream_name: "",
+        enabled: true,
+      },
+    ],
+  };
+}
+
+function makeDefaultModel() {
+  return {
+    alias: "",
+    upstream_name: "",
+    enabled: true,
+  };
 }
 
 function renderModelPills(container, allModels, selectedModels, checkboxClass) {
   container.innerHTML = "";
 
   if (!allModels.length) {
-    container.innerHTML = '<span class="hint">No models configured</span>';
+    container.innerHTML = '<span class="hint">当前没有模型，请先在供应商里添加模型。</span>';
     return;
   }
 
@@ -85,48 +120,161 @@ function renderModelPills(container, allModels, selectedModels, checkboxClass) {
   });
 }
 
-function renderModelOverview(config) {
-  const panel = document.getElementById("model-overview");
-  const rows = [];
+function renderProviderModels(tableBody, providerIndex) {
+  tableBody.innerHTML = "";
+  const provider = stateConfig.providers[providerIndex];
 
-  if (Array.isArray(config.providers)) {
-    config.providers.forEach((provider) => {
-      if (!Array.isArray(provider.models)) {
-        return;
-      }
-      provider.models.forEach((model) => {
-        rows.push(`
-          <tr>
-            <td>${escapeHtml(model.alias || "")}</td>
-            <td>${escapeHtml(model.upstream_name || "")}</td>
-            <td>${escapeHtml(provider.id || "")}</td>
-            <td>${escapeHtml(provider.protocol || "")}</td>
-            <td>${model.enabled ? "enabled" : "disabled"}</td>
-          </tr>
-        `);
-      });
-    });
+  if (!Array.isArray(provider.models)) {
+    provider.models = [];
   }
 
-  if (!rows.length) {
-    panel.innerHTML = '<p class="hint">No models found in config.</p>';
+  provider.models.forEach((model, modelIndex) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><input type="text" value="${escapeHtml(model.alias || "")}" class="model-alias" /></td>
+      <td><input type="text" value="${escapeHtml(model.upstream_name || "")}" class="model-upstream" /></td>
+      <td><input type="checkbox" class="model-enabled" ${model.enabled ? "checked" : ""} /></td>
+      <td><button type="button" class="danger btn-remove-model">删除模型</button></td>
+    `;
+
+    tr.querySelector(".model-alias").addEventListener("input", (e) => {
+      provider.models[modelIndex].alias = e.target.value;
+      collectModelAliases();
+      renderNewKeyModelSelector();
+    });
+
+    tr.querySelector(".model-upstream").addEventListener("input", (e) => {
+      provider.models[modelIndex].upstream_name = e.target.value;
+    });
+
+    tr.querySelector(".model-enabled").addEventListener("change", (e) => {
+      provider.models[modelIndex].enabled = e.target.checked;
+    });
+
+    tr.querySelector(".btn-remove-model").addEventListener("click", () => {
+      provider.models.splice(modelIndex, 1);
+      renderProviders();
+      collectModelAliases();
+      renderNewKeyModelSelector();
+    });
+
+    tableBody.appendChild(tr);
+  });
+
+  if (!provider.models.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = '<td colspan="4" class="hint">还没有模型，点击“新增模型”。</td>';
+    tableBody.appendChild(tr);
+  }
+}
+
+function renderProviders() {
+  const container = document.getElementById("provider-list");
+  container.innerHTML = "";
+
+  if (!stateConfig.providers.length) {
+    container.innerHTML = '<p class="hint">暂无供应商，点击上方“新增供应商”。</p>';
     return;
   }
 
-  panel.innerHTML = `
-    <table class="model-table">
-      <thead>
-        <tr>
-          <th>Alias</th>
-          <th>Upstream Model</th>
-          <th>Provider</th>
-          <th>Protocol</th>
-          <th>Status</th>
-        </tr>
-      </thead>
-      <tbody>${rows.join("")}</tbody>
-    </table>
-  `;
+  stateConfig.providers.forEach((provider, providerIndex) => {
+    if (!Array.isArray(provider.models)) {
+      provider.models = [];
+    }
+
+    const card = document.createElement("article");
+    card.className = "provider-card";
+
+    card.innerHTML = `
+      <div class="provider-head">
+        <h3>供应商 ${providerIndex + 1}</h3>
+        <button type="button" class="danger btn-remove-provider">删除供应商</button>
+      </div>
+
+      <div class="provider-grid">
+        <label>
+          ID
+          <input type="text" class="provider-id" value="${escapeHtml(provider.id || "")}" />
+        </label>
+        <label>
+          名称
+          <input type="text" class="provider-name" value="${escapeHtml(provider.name || "")}" />
+        </label>
+        <label>
+          BASE_URL
+          <input type="text" class="provider-base-url" value="${escapeHtml(provider.base_url || "")}" />
+        </label>
+        <label>
+          协议
+          <select class="provider-protocol">
+            <option value="openai" ${provider.protocol === "openai" ? "selected" : ""}>openai</option>
+            <option value="anthropic" ${provider.protocol === "anthropic" ? "selected" : ""}>anthropic</option>
+          </select>
+        </label>
+      </div>
+
+      <label>
+        API_KEY
+        <input type="text" class="provider-api-key" value="${escapeHtml(provider.api_key || "")}" />
+      </label>
+
+      <div class="models-head">
+        <h4>模型列表</h4>
+        <button type="button" class="btn-add-model">新增模型</button>
+      </div>
+
+      <table class="model-edit-table">
+        <thead>
+          <tr>
+            <th>本地别名 alias</th>
+            <th>上游模型 upstream_name</th>
+            <th>启用</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody class="model-edit-body"></tbody>
+      </table>
+    `;
+
+    card.querySelector(".provider-id").addEventListener("input", (e) => {
+      provider.id = e.target.value;
+    });
+
+    card.querySelector(".provider-name").addEventListener("input", (e) => {
+      provider.name = e.target.value;
+    });
+
+    card.querySelector(".provider-base-url").addEventListener("input", (e) => {
+      provider.base_url = e.target.value;
+    });
+
+    card.querySelector(".provider-protocol").addEventListener("change", (e) => {
+      provider.protocol = e.target.value;
+    });
+
+    card.querySelector(".provider-api-key").addEventListener("input", (e) => {
+      provider.api_key = e.target.value;
+    });
+
+    card.querySelector(".btn-remove-provider").addEventListener("click", () => {
+      stateConfig.providers.splice(providerIndex, 1);
+      renderProviders();
+      collectModelAliases();
+      renderNewKeyModelSelector();
+    });
+
+    card.querySelector(".btn-add-model").addEventListener("click", () => {
+      provider.models.push(makeDefaultModel());
+      renderProviders();
+      collectModelAliases();
+      renderNewKeyModelSelector();
+    });
+
+    const modelBody = card.querySelector(".model-edit-body");
+    renderProviderModels(modelBody, providerIndex);
+
+    container.appendChild(card);
+  });
 }
 
 function renderLocalKeys(keys) {
@@ -134,7 +282,7 @@ function renderLocalKeys(keys) {
   body.innerHTML = "";
 
   if (!Array.isArray(keys) || keys.length === 0) {
-    body.innerHTML = '<tr><td colspan="7" class="hint">No local keys yet.</td></tr>';
+    body.innerHTML = '<tr><td colspan="7" class="hint">暂无本地 Key。</td></tr>';
     return;
   }
 
@@ -153,8 +301,8 @@ function renderLocalKeys(keys) {
       <td>${escapeHtml(key.created_at)}</td>
       <td>
         <div class="actions">
-          <button type="button" class="save-key primary">Save</button>
-          <button type="button" class="delete-key danger">Delete</button>
+          <button type="button" class="save-key primary">保存</button>
+          <button type="button" class="delete-key danger">删除</button>
         </div>
       </td>
     `;
@@ -175,32 +323,32 @@ function selectedModelsFromContainer(container, checkboxClass) {
   return Array.from(checked).map((el) => el.value);
 }
 
-async function loadConfig() {
-  const config = await apiFetch("/api/config", { method: "GET" });
-  cachedModels = collectModelAliases(config);
-
-  editor.set(config);
-  renderModelOverview(config);
-
+function renderNewKeyModelSelector() {
   const newKeyModels = document.getElementById("new-key-models");
   renderModelPills(newKeyModels, cachedModels, [], "new-key-model");
 }
 
+async function loadConfig() {
+  const config = await apiFetch("/api/config", { method: "GET" });
+  stateConfig = ensureConfigShape(config);
+  collectModelAliases();
+  renderProviders();
+  renderNewKeyModelSelector();
+}
+
 async function saveConfig() {
-  const current = editor.get();
   const updated = await apiFetch("/api/config", {
     method: "PUT",
-    body: JSON.stringify(current),
+    body: JSON.stringify(stateConfig),
   });
 
-  cachedModels = collectModelAliases(updated);
-
-  renderModelOverview(updated);
-  const newKeyModels = document.getElementById("new-key-models");
-  renderModelPills(newKeyModels, cachedModels, [], "new-key-model");
+  stateConfig = ensureConfigShape(updated);
+  collectModelAliases();
+  renderProviders();
+  renderNewKeyModelSelector();
 
   await loadLocalKeys();
-  showStatus("Config saved.", "success");
+  showStatus("配置已保存。", "success");
 }
 
 async function loadLocalKeys() {
@@ -225,7 +373,7 @@ async function generateLocalKey() {
 
   document.getElementById("generated-key").textContent = result.plain_key;
   await loadLocalKeys();
-  showStatus("Local API key generated.", "success");
+  showStatus("本地 Key 已生成。", "success");
 }
 
 async function saveLocalKey(row) {
@@ -245,11 +393,11 @@ async function saveLocalKey(row) {
   });
 
   await loadLocalKeys();
-  showStatus(`Local key ${keyId} updated.`, "success");
+  showStatus(`本地 Key ${keyId} 已更新。`, "success");
 }
 
 async function deleteLocalKey(keyId) {
-  if (!window.confirm(`Delete local key ${keyId}?`)) {
+  if (!window.confirm(`确认删除本地 Key ${keyId} 吗？`)) {
     return;
   }
 
@@ -258,21 +406,28 @@ async function deleteLocalKey(keyId) {
   });
 
   await loadLocalKeys();
-  showStatus(`Local key ${keyId} deleted.`, "success");
+  showStatus(`本地 Key ${keyId} 已删除。`, "success");
 }
 
 function bindEvents() {
-  document.getElementById("btn-load").addEventListener("click", async () => {
+  document.getElementById("btn-reload").addEventListener("click", async () => {
     try {
       await loadConfig();
       await loadLocalKeys();
-      showStatus("Config reloaded.");
+      showStatus("配置已重新加载。", "success");
     } catch (err) {
       showStatus(String(err), "error");
     }
   });
 
-  document.getElementById("btn-save").addEventListener("click", async () => {
+  document.getElementById("btn-add-provider").addEventListener("click", () => {
+    stateConfig.providers.push(makeDefaultProvider());
+    collectModelAliases();
+    renderProviders();
+    renderNewKeyModelSelector();
+  });
+
+  document.getElementById("btn-save-config").addEventListener("click", async () => {
     try {
       await saveConfig();
     } catch (err) {
@@ -292,20 +447,12 @@ function bindEvents() {
 }
 
 async function init() {
-  editor = new JSONEditor(document.getElementById("editor"), {
-    mode: "tree",
-    modes: ["tree", "code", "form", "view"],
-    navigationBar: true,
-    statusBar: true,
-    mainMenuBar: true,
-  });
-
   bindEvents();
 
   try {
     await loadConfig();
     await loadLocalKeys();
-    showStatus("Loaded.", "success");
+    showStatus("已加载。", "success");
   } catch (err) {
     showStatus(String(err), "error");
   }
