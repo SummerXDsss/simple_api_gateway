@@ -1,0 +1,104 @@
+﻿<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Local AI API Aggregator</title>
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/jsoneditor@9.10.5/dist/jsoneditor.min.css"
+    />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="hero">
+        <h1>Local AI API Aggregator</h1>
+        <p>
+          Configure upstream providers, manage local API keys, and control
+          model access.
+        </p>
+      </header>
+
+      <section class="card">
+        <div class="card-title-row">
+          <h2>Provider Config (JSON)</h2>
+          <div class="actions">
+            <button id="btn-load" type="button">Reload</button>
+            <button id="btn-save" type="button" class="primary">Save</button>
+          </div>
+        </div>
+        <p class="hint">
+          Edit providers: <code>base_url</code>, <code>protocol</code>
+          (<code>openai</code>/<code>anthropic</code>),
+          <code>api_key</code>, and per-model enable flags.
+        </p>
+        <div id="editor" class="editor"></div>
+      </section>
+
+      <section class="card">
+        <h2>Model Overview</h2>
+        <div id="model-overview"></div>
+      </section>
+
+      <section class="card">
+        <h2>Create Local API Key</h2>
+        <div class="new-key-grid">
+          <label>
+            Key name
+            <input id="new-key-name" type="text" value="default-key" />
+          </label>
+          <div>
+            <div class="label">Allowed models</div>
+            <div id="new-key-models" class="model-pills"></div>
+            <p class="hint">No selection means this key can use all enabled models.</p>
+          </div>
+        </div>
+        <div class="actions">
+          <button id="btn-generate-key" type="button" class="primary">
+            Generate Local Key
+          </button>
+        </div>
+        <div class="result-box">
+          <div class="label">Generated key (shown once):</div>
+          <code id="generated-key">(not generated yet)</code>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Local API Keys</h2>
+        <table class="key-table">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Name</th>
+              <th>Prefix</th>
+              <th>Enabled</th>
+              <th>Allowed Models</th>
+              <th>Created At</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="key-table-body"></tbody>
+        </table>
+      </section>
+
+      <section class="card">
+        <h2>How to Call</h2>
+        <pre><code>POST /v1/chat/completions
+Authorization: Bearer &lt;local_api_key&gt;
+Content-Type: application/json
+
+{
+  "model": "gpt-4.1-mini",
+  "messages": [{"role": "user", "content": "hello"}]
+}</code></pre>
+      </section>
+
+      <div id="status" class="status"></div>
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/npm/jsoneditor@9.10.5/dist/jsoneditor.min.js"></script>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
