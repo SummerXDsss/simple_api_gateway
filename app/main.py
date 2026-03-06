@@ -1,11 +1,12 @@
 ﻿from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config_store import ConfigStore
@@ -20,6 +21,8 @@ from .relay import (
     relay_chat_completion,
     relay_messages,
     resolve_provider_and_model,
+    stream_chat_completion,
+    stream_messages,
 )
 from .schemas import (
     AppConfig,
@@ -33,7 +36,14 @@ from .security import generate_local_api_key, verify_local_api_key
 
 STORE = ConfigStore(Path("data/config.json"))
 
-app = FastAPI(title="Local AI API Aggregator", version="0.2.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    STORE.ensure_exists()
+    yield
+
+
+app = FastAPI(title="Local AI API Aggregator", version="0.3.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -82,7 +92,7 @@ def _authenticate_local_key(request: Request, config: AppConfig) -> LocalKeyReco
 
 async def _relay_openai_compatible(
     payload: dict[str, Any], request: Request
-) -> dict[str, Any]:
+) -> dict[str, Any] | StreamingResponse:
     config = STORE.load()
     local_key = _authenticate_local_key(request, config)
 
@@ -91,6 +101,12 @@ async def _relay_openai_compatible(
 
     provider, provider_model = resolve_provider_and_model(config, model_alias)
     assert_key_can_use_model(local_key, model_alias)
+
+    if normalized_payload.get("stream"):
+        return StreamingResponse(
+            stream_chat_completion(normalized_payload, provider, provider_model, model_alias),
+            media_type="text/event-stream",
+        )
 
     return await relay_chat_completion(
         normalized_payload,
@@ -102,7 +118,7 @@ async def _relay_openai_compatible(
 
 async def _relay_anthropic_messages_compatible(
     payload: dict[str, Any], request: Request
-) -> dict[str, Any]:
+) -> dict[str, Any] | StreamingResponse:
     config = STORE.load()
     local_key = _authenticate_local_key(request, config)
 
@@ -113,12 +129,13 @@ async def _relay_anthropic_messages_compatible(
     provider, provider_model = resolve_provider_and_model(config, model_alias)
     assert_key_can_use_model(local_key, model_alias)
 
+    if payload.get("stream"):
+        return StreamingResponse(
+            stream_messages(payload, provider, provider_model, model_alias),
+            media_type="text/event-stream",
+        )
+
     return await relay_messages(payload, provider, provider_model, model_alias)
-
-
-@app.on_event("startup")
-def on_startup() -> None:
-    STORE.ensure_exists()
 
 
 @app.get("/", include_in_schema=False)
@@ -242,14 +259,18 @@ def delete_local_key(key_id: str) -> dict[str, bool]:
 
 
 @app.post("/v1/chat/completions")
-async def openai_chat_proxy(payload: dict[str, Any], request: Request) -> JSONResponse:
+async def openai_chat_proxy(payload: dict[str, Any], request: Request) -> StreamingResponse | JSONResponse:
     result = await _relay_openai_compatible(payload, request)
+    if isinstance(result, StreamingResponse):
+        return result
     return JSONResponse(content=result)
 
 
 @app.post("/v1/responses")
 async def openai_responses_proxy(payload: dict[str, Any], request: Request) -> JSONResponse:
     result = await _relay_openai_compatible(payload, request)
+    if isinstance(result, StreamingResponse):
+        return result
     return JSONResponse(content=openai_chat_response_to_responses_api(result))
 
 
@@ -258,14 +279,18 @@ async def openai_legacy_completions_proxy(
     payload: dict[str, Any], request: Request
 ) -> JSONResponse:
     result = await _relay_openai_compatible(payload, request)
+    if isinstance(result, StreamingResponse):
+        return result
     return JSONResponse(content=openai_chat_response_to_completions(result))
 
 
 @app.post("/v1/messages")
 async def anthropic_messages_proxy(
     payload: dict[str, Any], request: Request
-) -> JSONResponse:
+) -> StreamingResponse | JSONResponse:
     result = await _relay_anthropic_messages_compatible(payload, request)
+    if isinstance(result, StreamingResponse):
+        return result
     return JSONResponse(content=result)
 
 
@@ -275,4 +300,6 @@ async def anthropic_legacy_complete_proxy(
 ) -> JSONResponse:
     converted = legacy_anthropic_complete_to_messages_request(payload)
     result = await _relay_anthropic_messages_compatible(converted, request)
+    if isinstance(result, StreamingResponse):
+        return result
     return JSONResponse(content=anthropic_message_response_to_legacy_complete(result))

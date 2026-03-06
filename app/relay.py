@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
+import json
 import time
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -317,12 +319,6 @@ def _map_openai_finish_reason(value: str | None) -> str:
 def openai_chat_request_to_anthropic(
     payload: dict[str, Any], upstream_model: str
 ) -> dict[str, Any]:
-    if payload.get("stream"):
-        raise HTTPException(
-            status_code=400,
-            detail="stream=true is not supported in this version.",
-        )
-
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         raise HTTPException(status_code=400, detail="messages must be a non-empty list.")
@@ -372,12 +368,6 @@ def openai_chat_request_to_anthropic(
 def anthropic_messages_request_to_openai_chat(
     payload: dict[str, Any], upstream_model: str
 ) -> dict[str, Any]:
-    if payload.get("stream"):
-        raise HTTPException(
-            status_code=400,
-            detail="stream=true is not supported in this version.",
-        )
-
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         raise HTTPException(status_code=400, detail="messages must be a non-empty list.")
@@ -544,6 +534,189 @@ async def _post_json(
     return data
 
 
+async def _stream_upstream(
+    url: str, headers: dict[str, str], payload: dict[str, Any]
+) -> AsyncIterator[bytes]:
+    """逐行转发上游 SSE 流，不做内容解析。"""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0)) as client:
+            async with client.stream("POST", url, headers=headers, json=payload) as response:
+                if response.status_code >= 400:
+                    body = await response.aread()
+                    try:
+                        err = json.loads(body)
+                    except ValueError:
+                        err = {"raw": body.decode("utf-8", errors="replace")}
+                    raise HTTPException(
+                        status_code=response.status_code,
+                        detail={
+                            "upstream_url": url,
+                            "upstream_status": response.status_code,
+                            "upstream_error": err,
+                        },
+                    )
+                async for line in response.aiter_lines():
+                    yield (line + "\n").encode()
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to reach upstream provider: {exc}",
+        ) from exc
+
+
+def _openai_stream_to_anthropic_stream(
+    local_model: str,
+) -> "type[_OpenAIToAnthropicStreamAdapter]":
+    """返回一个适配器类，用于在 relay_messages 的跨协议 streaming 场景中使用。"""
+    return _OpenAIToAnthropicStreamAdapter(local_model)
+
+
+class _OpenAIToAnthropicStreamAdapter:
+    """把 OpenAI chat.completion SSE 流转换为 Anthropic messages SSE 流。"""
+
+    def __init__(self, local_model: str) -> None:
+        self._local_model = local_model
+        self._msg_id = f"msg-{int(time.time())}"
+        self._input_tokens = 0
+        self._output_tokens = 0
+        self._sent_start = False
+        self._sent_delta = False
+
+    def _make_event(self, event: str, data: dict[str, Any]) -> bytes:
+        return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
+
+    def start_block(self) -> bytes:
+        self._sent_start = True
+        return (
+            self._make_event("message_start", {
+                "type": "message_start",
+                "message": {
+                    "id": self._msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self._local_model,
+                    "content": [],
+                    "stop_reason": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                },
+            })
+            + self._make_event("content_block_start", {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            })
+            + b"event: ping\ndata: {\"type\":\"ping\"}\n\n"
+        )
+
+    def convert_chunk(self, raw_line: bytes) -> bytes | None:
+        """把一行 OpenAI SSE data 转换为 Anthropic SSE 格式，返回 None 表示跳过。"""
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if not line.startswith("data:"):
+            return None
+        payload_str = line[5:].strip()
+        if payload_str == "[DONE]":
+            return None
+        try:
+            chunk = json.loads(payload_str)
+        except ValueError:
+            return None
+
+        choice = (chunk.get("choices") or [{}])[0]
+        delta = choice.get("delta") or {}
+        text = delta.get("content") or ""
+        finish_reason = choice.get("finish_reason")
+
+        usage = chunk.get("usage") or {}
+        if usage.get("prompt_tokens"):
+            self._input_tokens = int(usage["prompt_tokens"])
+        if usage.get("completion_tokens"):
+            self._output_tokens = int(usage["completion_tokens"])
+
+        out = b""
+        if not self._sent_start:
+            out += self.start_block()
+
+        if text:
+            out += self._make_event("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text},
+            })
+
+        if finish_reason is not None:
+            stop_reason = _map_openai_finish_reason(finish_reason)
+            out += (
+                self._make_event("content_block_stop", {"type": "content_block_stop", "index": 0})
+                + self._make_event("message_delta", {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                    "usage": {"output_tokens": self._output_tokens},
+                })
+                + self._make_event("message_stop", {"type": "message_stop"})
+            )
+
+        return out if out else None
+
+
+class _AnthropicToOpenAIStreamAdapter:
+    """把 Anthropic messages SSE 流转换为 OpenAI chat.completion SSE 流。"""
+
+    def __init__(self, local_model: str) -> None:
+        self._local_model = local_model
+        self._cmpl_id = f"chatcmpl-{int(time.time())}"
+        self._input_tokens = 0
+        self._output_tokens = 0
+        self._sent_role = False
+
+    def _make_chunk(self, delta: dict[str, Any], finish_reason: str | None = None) -> bytes:
+        chunk = {
+            "id": self._cmpl_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": self._local_model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        return f"data: {json.dumps(chunk)}\n\n".encode()
+
+    def convert_chunk(self, raw_line: bytes) -> bytes | None:
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if not line.startswith("data:"):
+            return None
+        payload_str = line[5:].strip()
+        try:
+            event_data = json.loads(payload_str)
+        except ValueError:
+            return None
+
+        event_type = event_data.get("type")
+        out = b""
+
+        if event_type == "message_start":
+            usage = (event_data.get("message") or {}).get("usage") or {}
+            self._input_tokens = int(usage.get("input_tokens") or 0)
+            if not self._sent_role:
+                self._sent_role = True
+                out += self._make_chunk({"role": "assistant", "content": ""})
+
+        elif event_type == "content_block_delta":
+            delta = event_data.get("delta") or {}
+            text = delta.get("text") or ""
+            if text:
+                out += self._make_chunk({"content": text})
+
+        elif event_type == "message_delta":
+            delta = event_data.get("delta") or {}
+            stop_reason = _map_anthropic_stop_reason(delta.get("stop_reason"))
+            usage = event_data.get("usage") or {}
+            self._output_tokens = int(usage.get("output_tokens") or 0)
+            out += self._make_chunk({}, finish_reason=stop_reason)
+
+        elif event_type == "message_stop":
+            out += b"data: [DONE]\n\n"
+
+        return out if out else None
+
+
 async def relay_chat_completion(
     payload: dict[str, Any],
     provider: ProviderConfig,
@@ -572,6 +745,42 @@ async def relay_chat_completion(
         payload=converted,
     )
     return anthropic_response_to_openai_chat(upstream, local_model)
+
+
+async def stream_chat_completion(
+    payload: dict[str, Any],
+    provider: ProviderConfig,
+    provider_model: ProviderModel,
+    local_model: str,
+) -> AsyncIterator[bytes]:
+    """Streaming 版本的 chat completion 转发，返回 OpenAI SSE 格式字节流。"""
+    if provider.protocol == "openai":
+        forward_payload = {**payload, "model": provider_model.upstream_name, "stream": True}
+        async for chunk in _stream_upstream(
+            url=_build_url(provider.base_url, "/v1/chat/completions"),
+            headers={"Authorization": f"Bearer {provider.api_key}"},
+            payload=forward_payload,
+        ):
+            yield chunk
+        return
+
+    # openai -> anthropic 跨协议 streaming
+    converted = openai_chat_request_to_anthropic(
+        {**payload, "stream": False}, provider_model.upstream_name
+    )
+    converted["stream"] = True
+    adapter = _AnthropicToOpenAIStreamAdapter(local_model)
+    async for raw in _stream_upstream(
+        url=_build_url(provider.base_url, "/v1/messages"),
+        headers={
+            "x-api-key": provider.api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        payload=converted,
+    ):
+        result = adapter.convert_chunk(raw)
+        if result:
+            yield result
 
 
 async def relay_messages(
@@ -604,3 +813,40 @@ async def relay_messages(
         payload=converted,
     )
     return openai_response_to_anthropic_message(upstream, local_model)
+
+
+async def stream_messages(
+    payload: dict[str, Any],
+    provider: ProviderConfig,
+    provider_model: ProviderModel,
+    local_model: str,
+) -> AsyncIterator[bytes]:
+    """Streaming 版本的 messages 转发，返回 Anthropic SSE 格式字节流。"""
+    if provider.protocol == "anthropic":
+        forward_payload = {**payload, "model": provider_model.upstream_name, "stream": True}
+        async for chunk in _stream_upstream(
+            url=_build_url(provider.base_url, "/v1/messages"),
+            headers={
+                "x-api-key": provider.api_key,
+                "anthropic-version": "2023-06-01",
+            },
+            payload=forward_payload,
+        ):
+            yield chunk
+        return
+
+    # anthropic -> openai 跨协议 streaming
+    converted = anthropic_messages_request_to_openai_chat(
+        {k: v for k, v in payload.items() if k != "stream"},
+        provider_model.upstream_name,
+    )
+    converted["stream"] = True
+    adapter = _OpenAIToAnthropicStreamAdapter(local_model)
+    async for raw in _stream_upstream(
+        url=_build_url(provider.base_url, "/v1/chat/completions"),
+        headers={"Authorization": f"Bearer {provider.api_key}"},
+        payload=converted,
+    ):
+        result = adapter.convert_chunk(raw)
+        if result:
+            yield result

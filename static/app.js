@@ -1,6 +1,22 @@
 ﻿let stateConfig = { providers: [], local_keys: [] };
 let cachedModels = [];
 
+function formatDateTime(iso) {
+  if (!iso) return "";
+  try {
+    return new Date(iso).toLocaleString("zh-CN", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  } catch (_) {
+    return iso;
+  }
+}
+
 function escapeHtml(value) {
   return String(value)
     .replaceAll("&", "&amp;")
@@ -16,6 +32,13 @@ function showStatus(message, type = "") {
   status.classList.remove("error", "success");
   if (type) {
     status.classList.add(type);
+  }
+  if (type === "success") {
+    clearTimeout(status._hideTimer);
+    status._hideTimer = setTimeout(() => {
+      status.classList.remove("success");
+      status.textContent = "";
+    }, 4000);
   }
 }
 
@@ -298,7 +321,7 @@ function renderLocalKeys(keys) {
       <td><code>${escapeHtml(key.key_prefix)}</code></td>
       <td><input type="checkbox" class="key-enabled" ${key.enabled ? "checked" : ""} /></td>
       <td class="key-models"><div id="${escapeHtml(modelCellId)}" class="model-pills"></div></td>
-      <td>${escapeHtml(key.created_at)}</td>
+      <td>${escapeHtml(formatDateTime(key.created_at))}</td>
       <td>
         <div class="actions">
           <button type="button" class="save-key primary">保存</button>
