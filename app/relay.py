@@ -616,21 +616,27 @@ async def _stream_upstream(
                         err = json.loads(body)
                     except ValueError:
                         err = {"raw": body.decode("utf-8", errors="replace")}
-                    raise HTTPException(
-                        status_code=response.status_code,
-                        detail={
-                            "upstream_url": url,
+                    # Cannot raise HTTPException inside a generator that has already
+                    # started streaming — yield an SSE error event instead.
+                    err_payload = json.dumps({
+                        "error": {
+                            "message": f"Upstream error {response.status_code}",
+                            "type": "upstream_error",
                             "upstream_status": response.status_code,
                             "upstream_error": err,
-                        },
-                    )
+                        }
+                    })
+                    yield f"data: {err_payload}\n\n".encode()
+                    yield b"data: [DONE]\n\n"
+                    return
                 async for line in response.aiter_lines():
                     yield (line + "\n").encode()
     except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Failed to reach upstream provider: {exc}",
-        ) from exc
+        err_payload = json.dumps({
+            "error": {"message": f"Failed to reach upstream: {exc}", "type": "connection_error"}
+        })
+        yield f"data: {err_payload}\n\n".encode()
+        yield b"data: [DONE]\n\n"
 
 
 def _openai_stream_to_anthropic_stream(
