@@ -13,7 +13,7 @@ def hash_key(plain_key: str) -> str:
 
 def generate_local_api_key() -> tuple[str, str, str]:
     token = secrets.token_urlsafe(24)
-    plain_key = f"lak-{token}"
+    plain_key = f"sk-{token}"
     return plain_key, hash_key(plain_key), plain_key[:12]
 
 

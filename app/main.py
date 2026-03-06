@@ -13,6 +13,7 @@ from .config_store import ConfigStore
 from .relay import (
     anthropic_message_response_to_legacy_complete,
     assert_key_can_use_model,
+    fetch_upstream_models,
     legacy_anthropic_complete_to_messages_request,
     list_all_model_aliases,
     normalize_openai_chat_payload,
@@ -23,6 +24,7 @@ from .relay import (
     resolve_provider_and_model,
     stream_chat_completion,
     stream_messages,
+    test_provider_connection,
 )
 from .schemas import (
     AppConfig,
@@ -181,6 +183,34 @@ def get_models() -> dict[str, list[dict[str, Any]]]:
     return {"models": models}
 
 
+@app.get("/v1/models")
+def list_models_openai_compat() -> dict[str, Any]:
+    """Standard OpenAI-compatible GET /v1/models endpoint.
+
+    Returns all enabled models as OpenAI model objects so that clients
+    like Cherry Studio, Cursor, and the OpenAI SDK can enumerate them.
+    """
+    import time as _time
+
+    config = STORE.load()
+    data: list[dict[str, Any]] = []
+
+    for provider in config.providers:
+        for model in provider.models:
+            if not model.enabled:
+                continue
+            data.append(
+                {
+                    "id": model.alias,
+                    "object": "model",
+                    "created": int(_time.time()),
+                    "owned_by": provider.name or provider.id,
+                }
+            )
+
+    return {"object": "list", "data": data}
+
+
 @app.get("/api/local-keys", response_model=list[LocalKeyPublic])
 def list_local_keys() -> list[LocalKeyPublic]:
     config = STORE.load()
@@ -258,7 +288,26 @@ def delete_local_key(key_id: str) -> dict[str, bool]:
     return {"deleted": True}
 
 
-@app.post("/v1/chat/completions")
+@app.post("/api/providers/{provider_id}/test")
+async def test_provider(provider_id: str) -> dict[str, Any]:
+    config = STORE.load()
+    provider = next((p for p in config.providers if p.id == provider_id), None)
+    if provider is None:
+        raise HTTPException(status_code=404, detail=f"Provider '{provider_id}' not found.")
+    return await test_provider_connection(provider)
+
+
+@app.get("/api/providers/{provider_id}/upstream-models")
+async def get_upstream_models(provider_id: str) -> dict[str, Any]:
+    config = STORE.load()
+    provider = next((p for p in config.providers if p.id == provider_id), None)
+    if provider is None:
+        raise HTTPException(status_code=404, detail=f"Provider '{provider_id}' not found.")
+    models = await fetch_upstream_models(provider)
+    return {"models": models}
+
+
+@app.post("/v1/chat/completions", response_model=None)
 async def openai_chat_proxy(payload: dict[str, Any], request: Request) -> StreamingResponse | JSONResponse:
     result = await _relay_openai_compatible(payload, request)
     if isinstance(result, StreamingResponse):
@@ -266,25 +315,25 @@ async def openai_chat_proxy(payload: dict[str, Any], request: Request) -> Stream
     return JSONResponse(content=result)
 
 
-@app.post("/v1/responses")
-async def openai_responses_proxy(payload: dict[str, Any], request: Request) -> JSONResponse:
+@app.post("/v1/responses", response_model=None)
+async def openai_responses_proxy(payload: dict[str, Any], request: Request) -> JSONResponse | StreamingResponse:
     result = await _relay_openai_compatible(payload, request)
     if isinstance(result, StreamingResponse):
         return result
     return JSONResponse(content=openai_chat_response_to_responses_api(result))
 
 
-@app.post("/v1/completions")
+@app.post("/v1/completions", response_model=None)
 async def openai_legacy_completions_proxy(
     payload: dict[str, Any], request: Request
-) -> JSONResponse:
+) -> JSONResponse | StreamingResponse:
     result = await _relay_openai_compatible(payload, request)
     if isinstance(result, StreamingResponse):
         return result
     return JSONResponse(content=openai_chat_response_to_completions(result))
 
 
-@app.post("/v1/messages")
+@app.post("/v1/messages", response_model=None)
 async def anthropic_messages_proxy(
     payload: dict[str, Any], request: Request
 ) -> StreamingResponse | JSONResponse:
@@ -294,10 +343,10 @@ async def anthropic_messages_proxy(
     return JSONResponse(content=result)
 
 
-@app.post("/v1/complete")
+@app.post("/v1/complete", response_model=None)
 async def anthropic_legacy_complete_proxy(
     payload: dict[str, Any], request: Request
-) -> JSONResponse:
+) -> JSONResponse | StreamingResponse:
     converted = legacy_anthropic_complete_to_messages_request(payload)
     result = await _relay_anthropic_messages_compatible(converted, request)
     if isinstance(result, StreamingResponse):

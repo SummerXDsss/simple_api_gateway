@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from threading import RLock
 
+from .crypto import decrypt, encrypt, is_encrypted
 from .schemas import AppConfig, ProviderConfig, ProviderModel
 
 
@@ -97,6 +98,11 @@ class ConfigStore:
         with self._lock:
             self.ensure_exists()
             raw = json.loads(self.path.read_text(encoding="utf-8"))
+            # 解密 api_key 字段
+            for provider in raw.get("providers", []):
+                key = provider.get("api_key", "")
+                if key and is_encrypted(key):
+                    provider["api_key"] = decrypt(key)
             config = AppConfig.model_validate(raw)
             validate_config(config)
             return config
@@ -108,5 +114,11 @@ class ConfigStore:
             return config
 
     def _write_unlocked(self, config: AppConfig) -> None:
-        serialized = json.dumps(config.model_dump(mode="json"), indent=2, ensure_ascii=True)
+        data = config.model_dump(mode="json")
+        # 加密 api_key 字段
+        for provider in data.get("providers", []):
+            key = provider.get("api_key", "")
+            if key and not is_encrypted(key):
+                provider["api_key"] = encrypt(key)
+        serialized = json.dumps(data, indent=2, ensure_ascii=True)
         self.path.write_text(serialized + "\n", encoding="utf-8")

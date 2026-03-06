@@ -15,6 +15,75 @@ def _build_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}{path}"
 
 
+async def test_provider_connection(provider: ProviderConfig) -> dict[str, Any]:
+    """向上游发送最小请求验证 api_key 有效性。返回 {"ok": bool, "detail": str}"""
+    if not provider.api_key:
+        return {"ok": False, "detail": "api_key 未配置"}
+
+    try:
+        if provider.protocol == "openai":
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    _build_url(provider.base_url, "/v1/models"),
+                    headers={"Authorization": f"Bearer {provider.api_key}"},
+                )
+            if resp.status_code < 400:
+                return {"ok": True, "detail": f"连接成功 (HTTP {resp.status_code})"}
+            try:
+                err = resp.json()
+                msg = err.get("error", {}).get("message") or str(err)
+            except Exception:
+                msg = resp.text[:200]
+            return {"ok": False, "detail": f"HTTP {resp.status_code}: {msg}"}
+
+        else:  # anthropic
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    _build_url(provider.base_url, "/v1/messages"),
+                    headers={
+                        "x-api-key": provider.api_key,
+                        "anthropic-version": "2023-06-01",
+                    },
+                    json={
+                        "model": (provider.models[0].upstream_name if provider.models else "claude-3-haiku-20240307"),
+                        "max_tokens": 1,
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+            if resp.status_code < 400:
+                return {"ok": True, "detail": f"连接成功 (HTTP {resp.status_code})"}
+            try:
+                err = resp.json()
+                msg = err.get("error", {}).get("message") or str(err)
+            except Exception:
+                msg = resp.text[:200]
+            return {"ok": False, "detail": f"HTTP {resp.status_code}: {msg}"}
+
+    except httpx.RequestError as exc:
+        return {"ok": False, "detail": f"网络错误: {exc}"}
+
+
+async def fetch_upstream_models(provider: ProviderConfig) -> list[str]:
+    """从上游 /v1/models 拉取模型 ID 列表（仅 OpenAI 协议支持）。"""
+    if provider.protocol != "openai":
+        return []
+    if not provider.api_key:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                _build_url(provider.base_url, "/v1/models"),
+                headers={"Authorization": f"Bearer {provider.api_key}"},
+            )
+        if resp.status_code >= 400:
+            return []
+        data = resp.json()
+        models = data.get("data") or []
+        return sorted(m["id"] for m in models if isinstance(m, dict) and m.get("id"))
+    except Exception:
+        return []
+
+
 def list_all_model_aliases(config: AppConfig) -> list[str]:
     aliases = {model.alias for provider in config.providers for model in provider.models}
     return sorted(aliases)
